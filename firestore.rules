@@ -1,0 +1,131 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default Deny Catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { return isSignedIn() && request.auth.token.email_verified == true; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    
+    // Auth lookup (Master Gate) - Note: get() is atomic within the request
+    function getProfile(uid) { return get(/databases/$(database)/documents/users/$(uid)).data; }
+    function isMemberOf(schoolId) { return isVerified() && getProfile(request.auth.uid).schoolId == schoolId; }
+    function isAdmin(schoolId) { return isMemberOf(schoolId) && getProfile(request.auth.uid).role in ['admin', 'super_admin']; }
+
+    // --- Validation Helpers ---
+
+    function isValidSchool(data) {
+      return data.keys().hasAll(['name', 'currency', 'createdAt']) &&
+             data.keys().size() >= 3 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
+             data.currency is string && data.currency.size() == 3 &&
+             data.createdAt == request.time;
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['schoolId', 'role', 'email', 'name']) &&
+             data.keys().size() == 4 &&
+             isValidId(data.schoolId) &&
+             data.role in ['super_admin', 'admin', 'accountant'] &&
+             data.email == request.auth.token.email &&
+             data.name is string && data.name.size() <= 100;
+    }
+
+    function isValidStudent(data) {
+      return data.keys().hasAll(['schoolId', 'fullName', 'grade', 'feePlan', 'status', 'createdAt']) &&
+             data.schoolId is string &&
+             data.fullName is string && data.fullName.size() <= 200 &&
+             data.grade is string && data.grade.size() <= 50 &&
+             data.feePlan is number && data.feePlan >= 0 &&
+             data.status in ['active', 'inactive'] &&
+             data.createdAt == request.time;
+    }
+
+    function isValidInvoice(data) {
+      return data.keys().hasAll(['schoolId', 'studentId', 'month', 'year', 'baseAmount', 'totalAmount', 'dueDate', 'status', 'createdAt']) &&
+             data.schoolId is string &&
+             data.studentId is string &&
+             data.month is number && data.month >= 1 && data.month <= 12 &&
+             data.year is number && data.year >= 2024 &&
+             data.baseAmount is number &&
+             data.totalAmount is number &&
+             data.dueDate is timestamp &&
+             data.status in ['pending', 'sent', 'paid', 'overdue'] &&
+             data.createdAt == request.time;
+    }
+
+    function isValidReceipt(data) {
+      return data.keys().hasAll(['schoolId', 'invoiceId', 'amountPaid', 'paymentDate', 'paymentMethod']) &&
+             data.schoolId is string &&
+             data.invoiceId is string &&
+             data.amountPaid is number &&
+             data.paymentDate == request.time &&
+             data.paymentMethod is string;
+    }
+
+    // --- Collections ---
+
+    // Schools
+    match /schools/{schoolId} {
+      allow get: if isMemberOf(schoolId);
+      allow create: if isVerified() && isValidSchool(incoming()) && isValidId(schoolId);
+      allow update: if isAdmin(schoolId) && 
+                      isValidSchool(incoming()) && 
+                      incoming().createdAt == existing().createdAt &&
+                      incoming().diff(existing()).affectedKeys().hasOnly(['name', 'address', 'logo', 'currency', 'lateFeeRules']);
+
+      // Students
+      match /students/{studentId} {
+        allow list: if isMemberOf(schoolId) && resource.data.schoolId == schoolId;
+        allow get: if isMemberOf(schoolId);
+        allow create: if isAdmin(schoolId) && isValidStudent(incoming()) && incoming().schoolId == schoolId;
+        allow update: if isAdmin(schoolId) && 
+                        isValidStudent(incoming()) && 
+                        incoming().schoolId == existing().schoolId &&
+                        incoming().createdAt == existing().createdAt;
+        allow delete: if isAdmin(schoolId);
+      }
+
+      // Invoices
+      match /invoices/{invoiceId} {
+        allow list: if isMemberOf(schoolId) && resource.data.schoolId == schoolId;
+        allow get: if isMemberOf(schoolId);
+        allow create: if isAdmin(schoolId) && isValidInvoice(incoming()) && incoming().schoolId == schoolId;
+        allow update: if isAdmin(schoolId) && 
+                        isValidInvoice(incoming()) && 
+                        incoming().schoolId == existing().schoolId &&
+                        incoming().createdAt == existing().createdAt &&
+                        (
+                          // Action: Mark Paid
+                          (incoming().status == 'paid' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'lateFee', 'totalAmount', 'lateFeeAppliedAt'])) ||
+                          // Action: Generic Edit
+                          (incoming().diff(existing()).affectedKeys().hasOnly(['dueDate', 'status', 'lateFee', 'totalAmount']))
+                        );
+      }
+
+      // Receipts
+      match /receipts/{receiptId} {
+        allow list: if isMemberOf(schoolId) && resource.data.schoolId == schoolId;
+        allow get: if isMemberOf(schoolId);
+        allow create: if isAdmin(schoolId) && isValidReceipt(incoming()) && incoming().schoolId == schoolId;
+      }
+    }
+
+    // Users (Split collection strategy would be better but following existing structure)
+    match /users/{userId} {
+      allow get: if isVerified() && (request.auth.uid == userId || getProfile(request.auth.uid).schoolId == existing().schoolId);
+      allow create: if isVerified() && request.auth.uid == userId && isValidUser(incoming());
+      allow update: if isVerified() && request.auth.uid == userId && 
+                      isValidUser(incoming()) &&
+                      incoming().diff(existing()).affectedKeys().hasOnly(['name']) &&
+                      incoming().schoolId == existing().schoolId &&
+                      incoming().role == existing().role;
+    }
+  }
+}
